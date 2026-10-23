@@ -1,0 +1,13 @@
+{
+  "build": {
+    "preview": {
+      "distribution": "internal",
+      "android": { "buildType": "apk" },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://restflow-dvqh.onrender.com",
+        "EXPO_PUBLIC_POS_API_URL": "https://restflowgo.onrender.com",
+        "EXPO_PUBLIC_USE_GO_POS": "true"
+      }
+    }
+  }
+}

@@ -1,0 +1,389 @@
+// apps/api/prisma/schema.prisma
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ──────────────────────────────────────────────
+// 1. CORE EVENT STORE
+model Event {
+  id              String    @id @default(uuid())
+  event_type      String
+  shop_id         String    @default("1")
+  actor_user_id   String?
+  idempotency_key String    @unique
+  // Business SKU (e.g. ST300) — references Item.item_id, NOT Item.id
+  item_id         String?
+  batch_number    String?
+  expiry_date     DateTime?
+  quantity        Float?
+  unit_cost       Decimal?  @db.Decimal(18, 4)
+  total_cost      Decimal?  @db.Decimal(18, 4)
+  supplier_id     String?
+  approved_by_id  String?
+  waste_reason    String?
+  waste_photo_url String?
+  payload         Json      @db.Json
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  actor      User?     @relation("ActorEvents", fields: [actor_user_id], references: [id])
+  approvedBy User?     @relation("ApprovedByEvents", fields: [approved_by_id], references: [id])
+  item       Item?     @relation(fields: [item_id], references: [item_id])
+  supplier   Supplier? @relation(fields: [supplier_id], references: [id])
+
+  @@index([event_type])
+  @@index([shop_id, event_type])
+  @@index([shop_id, item_id])
+  @@index([created_at])
+  @@index([idempotency_key])
+  // Hot paths: kitchen queue/history, consumption, POS, approvals
+  @@index([shop_id, event_type, created_at])
+  @@index([shop_id, approved_by_id, event_type])
+}
+
+// ──────────────────────────────────────────────
+// 2. MASTER DATA
+//
+// Category purposes (do not mix):
+// - Item.category              → raw / ingredient taxonomy (Meat, Dairy…)
+// - FinishedGoodCategory       → menu CHOICE pools only (Pizza, 1L Soda…) — never inventory
+// - Menu payload.category      → POS screen grouping (Combos, Drinks…)
+model FinishedGoodCategory {
+  id          String   @id @default(uuid())
+  code        String   @unique
+  name        String
+  description String?
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+  items       Item[]
+
+  @@index([is_active])
+}
+
+model Item {
+  id                        String                @id @default(uuid())
+  item_id                   String                @unique
+  name                      String
+  description               String?
+  unit                      String
+  /// Raw / ingredient taxonomy (NOT a choice pool)
+  category                  String?
+  /// Optional FG choice-pool membership (Pizza, 1L Soda, …)
+  finished_good_category_id String?
+  min_stock                 Float?                @default(0)
+  reorder_point             Float?                @default(10)
+  created_at                DateTime              @default(now())
+  updated_at                DateTime              @updatedAt
+
+  events               Event[]
+  inventory            InventoryProjection[]
+  recipes              Recipe[]
+  ingredients          RecipeIngredient[]    @relation("RawMaterial")
+  recipeOutputs        RecipeOutput[]        @relation("RecipeOutputItem")
+  finishedGoodCategory FinishedGoodCategory? @relation(fields: [finished_good_category_id], references: [id])
+
+  @@index([finished_good_category_id])
+  @@index([category])
+}
+
+model Supplier {
+  id              String   @id @default(uuid())
+  supplier_number String   @unique
+  name            String
+  contact_person  String?
+  phone           String?
+  email           String?
+  address         String?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+  events          Event[]
+}
+
+model User {
+  id              String   @id @default(uuid())
+  email           String   @unique
+  password        String
+  name            String
+  role            Role     @default(KITCHEN)
+  shop_id         String   @default("1")
+  is_active       Boolean  @default(true)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+  actor_events    Event[]  @relation("ActorEvents")
+  approved_events Event[]  @relation("ApprovedByEvents")
+
+  @@index([shop_id])
+  @@map("users")
+}
+
+enum Role {
+  MANAGER
+  KITCHEN
+  POS
+  ADMIN
+}
+
+// ──────────────────────────────────────────────
+// 3. RECIPE
+enum RecipeType {
+  SINGLE_OUTPUT
+  PORTION_OUTPUT
+  MULTI_OUTPUT
+  ASSEMBLY
+  CONVERSION
+  CO_PRODUCT
+  SUB_RECIPE
+}
+
+enum YieldBasis {
+  BATCH
+  UNIT
+}
+
+model Recipe {
+  id             String             @id @default(uuid())
+  recipe_code    String             @unique
+  item_id        String
+  item_name      String
+  standard_yield Float
+  unit           String
+  notes          String?
+  /// Operational group for list filters (Bakery, Hot kitchen, Dough…)
+  category       String?
+  recipe_type    RecipeType         @default(SINGLE_OUTPUT)
+  yield_quantity Float?
+  yield_unit     String?
+  yield_basis    YieldBasis         @default(BATCH)
+  is_active      Boolean            @default(true)
+  created_at     DateTime           @default(now())
+  updated_at     DateTime           @updatedAt
+
+  item        Item               @relation(fields: [item_id], references: [item_id])
+  ingredients RecipeIngredient[]
+  outputs     RecipeOutput[]
+
+  @@index([item_id])
+  @@index([is_active])
+  @@index([category])
+}
+
+model RecipeIngredient {
+  id                String   @id @default(uuid())
+  recipe_id         String
+  raw_item_id       String
+  raw_item_name     String
+  quantity_per_unit Float
+  unit              String
+  unit_cost         Decimal? @db.Decimal(18, 4)
+  notes             String?
+
+  recipe  Recipe @relation(fields: [recipe_id], references: [id])
+  rawItem Item?  @relation("RawMaterial", fields: [raw_item_id], references: [item_id])
+
+  @@unique([recipe_id, raw_item_id])
+  @@index([raw_item_id])
+}
+
+model RecipeOutput {
+  id                String   @id @default(uuid())
+  recipe_id         String
+  item_id           String
+  item_name         String?
+  standard_quantity Float?
+  unit              String
+  unit_weight       Float?
+  weight_unit       String?
+  is_default        Boolean  @default(false)
+  is_active         Boolean  @default(true)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  recipe Recipe @relation(fields: [recipe_id], references: [id])
+  item   Item?  @relation("RecipeOutputItem", fields: [item_id], references: [item_id])
+
+  @@unique([recipe_id, item_id])
+  @@index([recipe_id])
+  @@index([item_id])
+}
+
+// ──────────────────────────────────────────────
+// 4. READ MODELS
+model InventoryProjection {
+  id                     String    @id @default(uuid())
+  shop_id                String    @default("1")
+  item_id                String
+  available_stock        Float     @default(0)
+  expired_stock          Float     @default(0)
+  damaged_stock          Float     @default(0)
+  total_value            Decimal   @default(0) @db.Decimal(18, 4)
+  /// Live weighted-average unit cost (WAC). Updated on receive / production FG write-back.
+  avg_unit_cost          Decimal   @default(0) @db.Decimal(18, 6)
+  /// Last GRN unit cost (audit); live average is avg_unit_cost.
+  last_receipt_unit_cost Decimal?  @db.Decimal(18, 6)
+  days_to_expiry_min     Int?
+  last_received_at       DateTime?
+  next_expiry_date       DateTime?
+  last_counted_at        DateTime?
+  last_counted_qty       Float?
+  updated_at             DateTime  @updatedAt
+
+  item Item @relation(fields: [item_id], references: [item_id])
+
+  @@unique([shop_id, item_id])
+  @@index([shop_id, available_stock])
+  @@index([shop_id, days_to_expiry_min])
+}
+
+model VarianceBatch {
+  id              String   @id @default(uuid())
+  batch_id        String   @unique
+  shop_id         String   @default("1")
+  product_item_id String?
+  product_name    String?
+  source          String
+  expected_qty    Float    @default(0)
+  actual_qty      Float    @default(0)
+  variance_qty    Float    @default(0)
+  variance_pct    Float    @default(0)
+  value_affected  Decimal  @default(0) @db.Decimal(18, 4)
+  flagged         Boolean  @default(false)
+  reason_code     String?
+  reason_note     String?
+  lines           Json?
+  production_id   String?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@index([shop_id, flagged])
+  @@index([shop_id, created_at])
+}
+
+model WasteProjection {
+  id             String    @id @default(uuid())
+  shop_id        String    @default("1")
+  item_id        String
+  total_wasted   Float     @default(0)
+  total_value    Decimal   @default(0) @db.Decimal(18, 4)
+  reason_summary Json?
+  last_wasted_at DateTime?
+  updated_at     DateTime  @updatedAt
+
+  @@unique([shop_id, item_id])
+}
+
+model SalesProjection {
+  id              String   @id @default(uuid())
+  shop_id         String   @default("1")
+  period          String
+  total_sales     Decimal  @default(0) @db.Decimal(18, 4)
+  total_orders    Int      @default(0)
+  avg_order_value Decimal  @default(0) @db.Decimal(18, 4)
+  top_items       Json?
+  updated_at      DateTime @updatedAt
+
+  @@unique([shop_id, period])
+}
+
+model ProjectionLog {
+  id              String   @id @default(uuid())
+  projection_type String
+  event_id        String
+  status          String
+  error_message   String?
+  processed_at    DateTime @default(now())
+
+  @@index([projection_type])
+  @@index([processed_at])
+}
+
+// ──────────────────────────────────────────────
+// MENU / CATALOG (stable read models for POS)
+// ──────────────────────────────────────────────
+enum MenuProductionType {
+  recipe
+  stocked
+}
+
+model CatalogMenuItem {
+  id              String             @id @default(uuid())
+  menu_item_id    String
+  shop_id         String             @default("1")
+  name            String
+  production_type MenuProductionType
+  recipe_id       String?
+  stock_item_id   String?
+  selling_price   Decimal            @default(0) @db.Decimal(18, 4)
+  active          Boolean            @default(true)
+  created_at      DateTime           @default(now())
+  updated_at      DateTime           @updatedAt
+
+  categoryLinks MenuCategoryItem[]
+
+  @@unique([shop_id, menu_item_id])
+  @@index([shop_id, active])
+  @@index([production_type])
+}
+
+model MenuCategory {
+  id          String  @id @default(uuid())
+  category_id String
+  shop_id     String  @default("1")
+  name        String
+  active      Boolean @default(true)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  items  MenuCategoryItem[]
+  groups ComboSelectionGroup[]
+
+  @@unique([shop_id, category_id])
+  @@index([shop_id, active])
+}
+
+model MenuCategoryItem {
+  id           String          @id @default(uuid())
+  category_id  String
+  menu_item_id String
+
+  category MenuCategory    @relation(fields: [category_id], references: [id], onDelete: Cascade)
+  menuItem CatalogMenuItem @relation(fields: [menu_item_id], references: [id], onDelete: Cascade)
+
+  @@unique([category_id, menu_item_id])
+  @@index([menu_item_id])
+}
+
+model Combo {
+  id            String   @id @default(uuid())
+  combo_id      String
+  shop_id       String   @default("1")
+  name          String
+  selling_price Decimal  @default(0) @db.Decimal(18, 4)
+  active        Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  groups ComboSelectionGroup[]
+
+  @@unique([shop_id, combo_id])
+  @@index([shop_id, active])
+}
+
+model ComboSelectionGroup {
+  id               String @id @default(uuid())
+  combo_id         String
+  group_index      Int
+  menu_category_id String
+  quantity         Int    @default(1)
+
+  combo        Combo        @relation(fields: [combo_id], references: [id], onDelete: Cascade)
+  menuCategory MenuCategory @relation(fields: [menu_category_id], references: [id])
+
+  @@unique([combo_id, group_index])
+  @@index([menu_category_id])
+}
