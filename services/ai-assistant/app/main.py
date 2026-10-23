@@ -20,7 +20,7 @@ logger = logging.getLogger("restflow.ai_assistant")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 RESTFLOW_API_URL = os.getenv("RESTFLOW_API_URL", "http://localhost:3000").rstrip("/")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
 REQUEST_TIMEOUT_SECONDS = max(3.0, min(float(os.getenv("REQUEST_TIMEOUT_SECONDS", "12")), 30.0))
 MAX_TOOL_CALLS = max(1, min(int(os.getenv("MAX_TOOL_CALLS", "3")), 5))
 MAX_REQUESTS_PER_MINUTE = max(1, min(int(os.getenv("MAX_REQUESTS_PER_MINUTE", "20")), 120))
@@ -361,90 +361,288 @@ async def execute_tool(name: str, args: dict[str, Any], token: str, shop_id: str
     raise ValueError("Tool not available.")
 
 
-async def run_agent(message: str, token: str, shop_id: str, restflow: RestFlowClient, role: str = "MANAGER") -> AssistantResponse:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=503, detail="AI service is not configured yet. Set OPENAI_API_KEY on the server.")
-    try:
-        from openai import AsyncOpenAI
-    except ImportError as exc:
-        logger.error("OpenAI Python SDK is not installed")
-        raise HTTPException(status_code=503, detail="AI service dependencies are not installed") from exc
+def _gemini_schema(schema: Any) -> Any:
+    """Convert the existing JSON-schema-like tool parameters to Gemini schema."""
+    if isinstance(schema, list):
+        return [_gemini_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
 
-    client = AsyncOpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=1)
+    # Gemini function schemas use a supported subset of JSON Schema; omit
+    # additionalProperties, which is unnecessary because the app validates args.
+    converted = {
+        key: _gemini_schema(value)
+        for key, value in schema.items()
+        if key != "additionalProperties"
+    }
+    schema_type = converted.get("type")
+    if isinstance(schema_type, list):
+        non_null_types = [item for item in schema_type if item != "null"]
+        if len(non_null_types) == 1:
+            converted["type"] = non_null_types[0]
+        elif non_null_types:
+            converted["type"] = non_null_types
+        else:
+            converted.pop("type", None)
+        if "null" in schema_type:
+            converted["nullable"] = True
+    return converted
+
+
+def _gemini_tool_declarations(allowed_names: set[str]) -> list[dict[str, Any]]:
+    declarations: list[dict[str, Any]] = []
+    for name, schema in TOOL_SCHEMAS.items():
+        if name not in allowed_names:
+            continue
+        declaration: dict[str, Any] = {
+            "name": name,
+            "description": schema["description"],
+            "parameters": _gemini_schema(schema["parameters"]),
+        }
+        declarations.append(declaration)
+    return declarations
+
+
+async def run_agent(
+    message: str,
+    token: str,
+    shop_id: str,
+    restflow: RestFlowClient,
+    role: str = "MANAGER",
+) -> AssistantResponse:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="AI service is not configured yet. Set GEMINI_API_KEY on the server.",
+        )
+
+    model = GEMINI_MODEL or "gemini-flash-latest"
     allowed_names = ROLE_TOOLS.get(role.upper(), set())
-    available_tools = [TOOL_SCHEMAS[name] for name in TOOL_SCHEMAS if name in allowed_names]
-    input_items: list[dict[str, Any]] = [{"role": "user", "content": message}]
+    declarations = _gemini_tool_declarations(allowed_names)
+    contents: list[dict[str, Any]] = [
+        {"role": "user", "parts": [{"text": message}]}
+    ]
     evidence: list[dict[str, Any]] = []
     tool_results: list[dict[str, Any]] = []
     tools_used: list[str] = []
+    total_tool_calls = 0
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{quote(model, safe='')}:generateContent"
+    )
+    request_payload: dict[str, Any] = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTIONS}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048,
+        },
+    }
+    if declarations:
+        request_payload["tools"] = [{"functionDeclarations": declarations}]
+        request_payload["toolConfig"] = {
+            "functionCallingConfig": {"mode": "AUTO"}
+        }
+
     try:
-        for _ in range(MAX_TOOL_CALLS + 1):
-            response = await client.responses.create(
-                model=OPENAI_MODEL,
-                instructions=SYSTEM_INSTRUCTIONS,
-                input=input_items,
-                tools=available_tools,
-                max_tool_calls=MAX_TOOL_CALLS,
-            )
-            usage = getattr(response, "usage", None)
-            if usage is not None:
-                _metric("assistant_input_tokens_total", int(getattr(usage, "input_tokens", 0) or 0))
-                _metric("assistant_output_tokens_total", int(getattr(usage, "output_tokens", 0) or 0))
-            calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
-            if not calls:
-                answer = (response.output_text or "I couldn't produce a useful answer. Please try rephrasing your question.").strip()
-                return AssistantResponse(
-                    answer=answer,
-                    evidence=[EvidenceItem(**item) for item in evidence],
-                    tool_used=list(dict.fromkeys(tools_used)),
-                    tool_results=tool_results,
-                    suggested_questions=(
-                        ["Which items are critically low?", "What operational issue should I investigate next?"]
-                        if tools_used else ["Which inventory items are running low?", "What waste was recorded in the last 30 days?"]
-                    ),
-                    limitations=[] if tools_used else ["No live RestFlow lookup was used for this answer."],
-                )
-            input_items.extend(item.model_dump(exclude_none=True) for item in response.output)
-            for call in calls:
-                output: dict[str, Any]
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            for _ in range(MAX_TOOL_CALLS + 1):
                 try:
+                    response = await client.post(
+                        endpoint,
+                        headers={
+                            "x-goog-api-key": api_key,
+                            "Content-Type": "application/json",
+                        },
+                        json=request_payload,
+                    )
+                except httpx.TimeoutException as exc:
+                    logger.warning("Gemini request timed out: model=%s", model)
+                    raise HTTPException(
+                        status_code=504,
+                        detail="The AI provider timed out. Please try again.",
+                    ) from exc
+                except httpx.HTTPError as exc:
+                    logger.warning(
+                        "Gemini connection failed: error_type=%s",
+                        type(exc).__name__,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The AI assistant is temporarily unavailable. Please try again.",
+                    ) from exc
+
+                if response.status_code >= 400:
+                    # Do not log request headers, API keys, user prompts, or raw provider bodies.
+                    logger.warning(
+                        "Gemini API rejected request: model=%s status=%s",
+                        model,
+                        response.status_code,
+                    )
+                    if response.status_code in (401, 403):
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Gemini API authentication failed. Check GEMINI_API_KEY on the server.",
+                        )
+                    if response.status_code == 429:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Gemini API rate limit or quota reached. Please try again later.",
+                        )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The Gemini AI provider is temporarily unavailable.",
+                    )
+
+                try:
+                    response_data = response.json()
+                except ValueError as exc:
+                    logger.warning("Gemini returned invalid JSON")
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The Gemini AI provider returned an invalid response.",
+                    ) from exc
+
+                usage = response_data.get("usageMetadata") or {}
+                _metric("assistant_input_tokens_total", int(usage.get("promptTokenCount", 0) or 0))
+                _metric("assistant_output_tokens_total", int(usage.get("candidatesTokenCount", 0) or 0))
+
+                candidates = response_data.get("candidates") or []
+                if not candidates or not isinstance(candidates[0], dict):
+                    logger.warning("Gemini returned no usable candidate: model=%s", model)
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The AI provider did not return an answer. Please try rephrasing your question.",
+                    )
+
+                candidate_content = candidates[0].get("content") or {}
+                parts = candidate_content.get("parts") or []
+                calls: list[dict[str, Any]] = []
+                for part in parts:
+                    if isinstance(part, dict) and isinstance(part.get("functionCall"), dict):
+                        calls.append(part["functionCall"])
+
+                if not calls:
+                    answer = "\n".join(
+                        str(part.get("text", ""))
+                        for part in parts
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    ).strip()
+                    if not answer:
+                        answer = "I couldn't produce a useful answer. Please try rephrasing your question."
+                    return AssistantResponse(
+                        answer=answer,
+                        evidence=[EvidenceItem(**item) for item in evidence],
+                        tool_used=list(dict.fromkeys(tools_used)),
+                        tool_results=tool_results,
+                        suggested_questions=(
+                            ["Which items are critically low?", "What operational issue should I investigate next?"]
+                            if tools_used
+                            else ["Which inventory items are running low?", "What waste was recorded in the last 30 days?"]
+                        ),
+                        limitations=[] if tools_used else ["No live RestFlow lookup was used for this answer."],
+                    )
+
+                if total_tool_calls + len(calls) > MAX_TOOL_CALLS:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The assistant reached its tool-call limit. Please try a more specific question.",
+                    )
+
+                # Keep the model's exact function-call turn in the conversation history.
+                contents.append(candidate_content)
+                function_response_parts: list[dict[str, Any]] = []
+                for call in calls:
+                    name = call.get("name")
+                    raw_args = call.get("args") or {}
+                    output: dict[str, Any]
+                    total_tool_calls += 1
                     _metric("assistant_tool_calls_total")
                     tool_started = time.perf_counter()
-                    args = json.loads(call.arguments or "{}")
-                    if not isinstance(args, dict): raise ValueError("Tool arguments must be an object.")
-                    data, source = await execute_tool(call.name, args, token, shop_id, role, restflow)
-                    truncated = _is_truncated(data)
-                    bounded = _bounded_result(data)
-                    source_count = len(data) if isinstance(data, list) else None
-                    tools_used.append(call.name)
-                    tool_results.append({"tool": call.name, "source": source, "data": bounded, "truncated": truncated, "source_count": source_count})
-                    if call.name == "get_low_stock_items" and isinstance(bounded, list):
-                        evidence = bounded
-                    logger.info("Assistant tool completed; tool=%s duration_ms=%s truncated=%s", call.name, int((time.perf_counter() - tool_started) * 1000), truncated)
-                    output = {"source": source, "data": bounded, "truncated": truncated, "source_count": source_count}
-                except HTTPException:
-                    _metric("assistant_tool_failures_total")
-                    raise
-                except json.JSONDecodeError:
-                    _metric("assistant_tool_failures_total")
-                    output = {"error": "Invalid tool arguments."}
-                except PermissionError:
-                    _metric("assistant_tool_failures_total")
-                    output = {"error": "This tool is not available for your role."}
-                except ValueError as exc:
-                    _metric("assistant_tool_failures_total")
-                    output = {"error": str(exc)}
-                input_items.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps(output, default=str)[:30000]})
-        raise HTTPException(status_code=502, detail="The assistant reached its tool-call limit. Please try a more specific question.")
+                    try:
+                        if not isinstance(name, str) or not name:
+                            raise ValueError("Invalid tool name.")
+                        if isinstance(raw_args, str):
+                            args = json.loads(raw_args or "{}")
+                        else:
+                            args = raw_args
+                        if not isinstance(args, dict):
+                            raise ValueError("Tool arguments must be an object.")
+
+                        data, source = await execute_tool(
+                            name, args, token, shop_id, role, restflow
+                        )
+                        truncated = _is_truncated(data)
+                        bounded = _bounded_result(data)
+                        source_count = len(data) if isinstance(data, list) else None
+                        tools_used.append(name)
+                        tool_results.append({
+                            "tool": name,
+                            "source": source,
+                            "data": bounded,
+                            "truncated": truncated,
+                            "source_count": source_count,
+                        })
+                        if name == "get_low_stock_items" and isinstance(bounded, list):
+                            evidence = bounded
+                        logger.info(
+                            "Assistant tool completed; tool=%s duration_ms=%s truncated=%s",
+                            name,
+                            int((time.perf_counter() - tool_started) * 1000),
+                            truncated,
+                        )
+                        output = {
+                            "source": source,
+                            "data": bounded,
+                            "truncated": truncated,
+                            "source_count": source_count,
+                        }
+                    except HTTPException:
+                        _metric("assistant_tool_failures_total")
+                        raise
+                    except json.JSONDecodeError:
+                        _metric("assistant_tool_failures_total")
+                        output = {"error": "Invalid tool arguments."}
+                    except PermissionError:
+                        _metric("assistant_tool_failures_total")
+                        output = {"error": "This tool is not available for your role."}
+                    except ValueError as exc:
+                        _metric("assistant_tool_failures_total")
+                        output = {"error": str(exc)}
+                    except Exception as exc:
+                        _metric("assistant_tool_failures_total")
+                        logger.warning(
+                            "Assistant tool failed; tool=%s error_type=%s",
+                            name if isinstance(name, str) else "unknown",
+                            type(exc).__name__,
+                        )
+                        output = {"error": "Tool execution failed."}
+
+                    function_response_parts.append({
+                        "functionResponse": {
+                            "name": name if isinstance(name, str) and name else "unknown_tool",
+                            "response": output,
+                        }
+                    })
+
+                # Gemini expects tool results as a user turn following the model turn.
+                contents.append({"role": "user", "parts": function_response_parts})
+                request_payload["contents"] = contents
+
+        raise HTTPException(
+            status_code=502,
+            detail="The assistant reached its tool-call limit. Please try a more specific question.",
+        )
     except HTTPException:
         raise
     except Exception as exc:
         _metric("assistant_provider_failures_total")
-        logger.warning("AI provider request failed (%s)", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="The AI assistant is temporarily unavailable. Please try again.") from exc
-    finally:
-        await client.close()
+        logger.warning("Gemini provider request failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="The AI assistant is temporarily unavailable. Please try again.",
+        ) from exc
 
 
 @asynccontextmanager
@@ -455,7 +653,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="RestFlow AI Operations Assistant",
     version="0.1.0",
-    description="Read-only AI assistant using authorized RestFlow operational tools.",
+    description="Read-only Gemini AI assistant using authorized RestFlow operational tools.",
     lifespan=lifespan,
 )
 
@@ -484,8 +682,8 @@ async def metrics() -> dict[str, int]:
 async def ready() -> dict[str, str]:
     if not RESTFLOW_API_URL:
         raise HTTPException(status_code=503, detail="RESTFLOW_API_URL is not configured")
-    if not os.getenv("OPENAI_API_KEY", "").strip():
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
     return {"status": "ready", "service": "restflow-ai-assistant"}
 
 
