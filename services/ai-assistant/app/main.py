@@ -101,7 +101,12 @@ class RestFlowClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
-    async def _get(self, path: str, token: str, params: dict[str, str] | None = None) -> Any:
+    async def _get(
+        self,
+        path: str,
+        token: str,
+        params: dict[str, str] | None = None,
+    ) -> Any:
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.get(
@@ -110,21 +115,72 @@ class RestFlowClient:
                     params=params,
                 )
         except httpx.TimeoutException as exc:
-            raise HTTPException(status_code=504, detail="RestFlow API timed out") from exc
+            logger.warning(
+                "NestJS request timed out: path=%s error_type=%s",
+                path,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="RestFlow API timed out",
+            ) from exc
         except httpx.HTTPError as exc:
-            logger.warning("NestJS request failed (%s)", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="RestFlow API is temporarily unavailable") from exc
+            logger.warning(
+                "NestJS connection failed: path=%s error_type=%s",
+                path,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="RestFlow API is temporarily unavailable",
+            ) from exc
+
+        if response.status_code >= 500:
+            logger.warning(
+                "NestJS upstream error: path=%s status=%s request_id=%s",
+                path,
+                response.status_code,
+                response.headers.get("x-request-id", "unavailable"),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="RestFlow API is temporarily unavailable",
+            )
 
         if response.status_code in (401, 403):
-            raise HTTPException(status_code=response.status_code, detail="Not authorized to access this RestFlow data")
-        if response.status_code >= 500:
-            raise HTTPException(status_code=502, detail="RestFlow API is temporarily unavailable")
+            logger.warning(
+                "NestJS authorization rejected: path=%s status=%s",
+                path,
+                response.status_code,
+            )
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Not authorized to access this RestFlow data",
+            )
+
         if response.status_code >= 400:
-            raise HTTPException(status_code=502, detail="RestFlow could not complete the requested lookup")
+            logger.warning(
+                "NestJS request rejected: path=%s status=%s",
+                path,
+                response.status_code,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="RestFlow could not complete the requested lookup",
+            )
+
         try:
             return response.json()
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail="RestFlow returned an invalid response") from exc
+            logger.warning(
+                "NestJS returned invalid JSON: path=%s status=%s",
+                path,
+                response.status_code,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="RestFlow returned an invalid response",
+            ) from exc
 
     async def authenticate(self, token: str) -> dict[str, Any]:
         user = await self._get("/users/me", token)
