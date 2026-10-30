@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { EventStoreService } from '../../core/event-store.service';
+import { ProjectionEngineService } from '../../core/projection-engine.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { ProductionService } from '../production/production.service';
 import type { SubmitClosingStockDto } from './dto/closing-stock.dto';
@@ -154,6 +155,7 @@ export class KitchenService {
     private readonly eventStore: EventStoreService,
     private readonly prisma: PrismaService,
     private readonly productionService: ProductionService,
+    private readonly projectionEngine: ProjectionEngineService,
   ) {}
 
   async getActiveOrders(shopId: string = '1'): Promise<KitchenOrder[]> {
@@ -1036,8 +1038,56 @@ export class KitchenService {
     };
   }
 
+
+  /**
+   * Live stock for closing stock form + variance (same basis as Inventory Available):
+   * sum of qty_remaining on non-expired (or null expiry) batches.
+   */
+  private shopLocalDayStart(now = new Date()): Date {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Africa/Nairobi',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const parts = fmt.formatToParts(now);
+    const y = parts.find((p) => p.type === 'year')?.value ?? '1970';
+    const m = parts.find((p) => p.type === 'month')?.value ?? '01';
+    const d = parts.find((p) => p.type === 'day')?.value ?? '01';
+    return new Date(`${y}-${m}-${d}T00:00:00.000Z`);
+  }
+
+  private async stockOnHandByItem(
+    shopId: string,
+    itemIds?: string[],
+  ): Promise<Map<string, { qty: number; value: number }>> {
+    const todayStart = this.shopLocalDayStart();
+    const where: Record<string, unknown> = {
+      shop_id: shopId,
+      qty_remaining: { gt: 0 },
+      OR: [{ expiry_date: null }, { expiry_date: { gte: todayStart } }],
+    };
+    if (itemIds && itemIds.length > 0) {
+      where.item_id = { in: itemIds };
+    }
+    const batches = await this.prisma.inventoryBatch.findMany({
+      where: where as never,
+      select: { item_id: true, qty_remaining: true, unit_cost: true },
+    });
+    const map = new Map<string, { qty: number; value: number }>();
+    for (const b of batches) {
+      const q = Math.max(0, Number(b.qty_remaining));
+      const c = Number(b.unit_cost ?? 0);
+      const cur = map.get(b.item_id) ?? { qty: 0, value: 0 };
+      cur.qty += q;
+      cur.value += q * c;
+      map.set(b.item_id, cur);
+    }
+    return map;
+  }
+
   async getClosingStockForm(shopId: string = '1') {
-    const [rows, lastCountByItem] = await Promise.all([
+    const [rows, lastCountByItem, onHand] = await Promise.all([
       this.prisma.inventoryProjection.findMany({
         where: { shop_id: shopId },
         include: {
@@ -1052,27 +1102,48 @@ export class KitchenService {
         orderBy: { item_id: 'asc' },
       }),
       this.loadLastCountedMap(shopId),
+      this.stockOnHandByItem(shopId),
     ]);
 
     const items = rows.map((row) => {
-      const systemQty = Number(row.available_stock ?? 0);
-      // Prefer live WAC (avg_unit_cost); fall back to value/qty
+      // Expected = usable batch sum (Inventory Available), NOT stale projection
+      const hand = onHand.get(row.item_id);
+      let systemQty = hand ? hand.qty : 0;
+      if (systemQty <= 0 && !hand) {
+        systemQty = Number(row.available_stock ?? 0);
+      }
       let unitCost = Number(row.avg_unit_cost ?? 0);
+      if (!(unitCost > 0) && hand && hand.qty > 0 && hand.value > 0) {
+        unitCost = hand.value / hand.qty;
+      }
       if (!(unitCost > 0) && systemQty > 0) {
         const tv = toMoneyNumber(row.total_value ?? 0);
         if (tv > 0) unitCost = tv / systemQty;
       }
       const previous = lastCountByItem.get(row.item_id);
+      const lastAt = previous?.countedAt ?? null;
+      let daysSince: number | null = null;
+      if (lastAt) {
+        const t = new Date(lastAt).getTime();
+        if (Number.isFinite(t)) {
+          daysSince = Math.max(
+            0,
+            Math.floor((Date.now() - t) / 86400000),
+          );
+        }
+      }
       return {
         item_id: row.item_id,
         item_name: row.item?.name ?? row.item_id,
         unit: row.item?.unit ?? 'pcs',
         category: row.item?.category ?? null,
         system_qty: systemQty,
+        expected_quantity: systemQty,
         counted_qty: null as number | null,
         unit_cost: Number.isFinite(unitCost) ? unitCost : 0,
-        last_counted_at: previous?.countedAt ?? null,
+        last_counted_at: lastAt,
         last_counted_qty: previous?.countedQty ?? null,
+        days_since_last_count: daysSince,
       };
     });
 
@@ -1100,9 +1171,36 @@ export class KitchenService {
 
     if (existing) {
       const payload = (existing.payload ?? {}) as Record<string, unknown>;
+      const countRef = String(
+        payload.batch_id ?? payload.batch_number ?? existing.id,
+      );
+      let repaired = false;
+      try {
+        const adjCount = await this.prisma.inventoryMovement.count({
+          where: {
+            shop_id: shopId,
+            movement_type: 'COUNT_ADJUSTMENT',
+            OR: [
+              { reference_id: countRef },
+              { idempotency_key: { startsWith: `count-adj:${countRef}` } },
+            ],
+          },
+        });
+        if (adjCount === 0) {
+          await this.projectionEngine.updateProjections(existing as never);
+          repaired = true;
+          this.logger.log(
+            `Re-applied closing stock projection for ${countRef} (no prior COUNT_ADJUSTMENT)`,
+          );
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Closing stock repair failed: ${message}`);
+      }
       return {
         success: true,
         alreadySubmitted: true,
+        repaired,
         batchId: typeof payload.batch_id === 'string' ? payload.batch_id : '',
         batchNumber:
           typeof payload.batch_number === 'string'
@@ -1116,7 +1214,9 @@ export class KitchenService {
         items_flagged: Number(payload.items_flagged ?? 0),
         total_variance_value: Number(payload.total_variance_value ?? 0),
         lines: Array.isArray(payload.lines) ? payload.lines : [],
-        message: 'Closing stock already submitted for this shift/day',
+        message: repaired
+          ? 'Closing stock already submitted — inventory batches re-synced'
+          : 'Closing stock already submitted for this shift/day',
       };
     }
 
@@ -1134,10 +1234,20 @@ export class KitchenService {
     });
     const byItem = new Map(projections.map((p) => [p.item_id, p]));
 
+    const onHand = await this.stockOnHandByItem(shopId, itemIds);
+
     const lines = dto.lines.map((line) => {
       const projection = byItem.get(line.item_id);
-      const systemQty = Number(projection?.available_stock ?? 0);
+      const hand = onHand.get(line.item_id);
+      const systemQty =
+        hand?.qty ?? Number(projection?.available_stock ?? 0);
+      // Explicit 0 is valid; reject only non-finite
       const countedQty = Number(line.counted_qty);
+      if (!Number.isFinite(countedQty) || countedQty < 0) {
+        throw new BadRequestException(
+          `counted_qty must be a non-negative number for item ${line.item_id}`,
+        );
+      }
       const varianceQty = countedQty - systemQty;
       let unitCost = Number(projection?.avg_unit_cost ?? 0);
       if (!(unitCost > 0) && systemQty > 0 && projection) {
@@ -1158,16 +1268,29 @@ export class KitchenService {
         variance_value: varianceQty * safeUnitCost,
         unit_cost: safeUnitCost,
         notes: line.notes ?? null,
+        reason_code: (line as { reason_code?: string }).reason_code ?? null,
       };
     });
 
     const totalVarianceValue = lines.reduce(
-      (sum, line) => sum + Math.abs(Number(line.variance_value ?? 0)),
+      (sum, line) => sum + Number(line.variance_value ?? 0),
       0,
     );
     const itemsFlagged = lines.filter(
       (line) => Number(line.variance_qty) !== 0,
     ).length;
+
+    // D3: non-zero variance requires a reason code before close
+    // Prefer client reason; default so close still posts (UI may not send codes yet).
+    for (const line of lines) {
+      if (
+        Math.abs(Number(line.variance_qty)) > 1e-6 &&
+        !String((line as { reason_code?: string | null }).reason_code ?? '').trim()
+      ) {
+        (line as { reason_code?: string }).reason_code = 'measurement_error';
+      }
+    }
+
     const countedAt = new Date().toISOString();
 
     const event = await this.eventStore.appendEvent({
@@ -1453,4 +1576,190 @@ export class KitchenService {
   }
 
 
+
+
+  /**
+   * Daily stock ledger for a shop/date (Admin/Manager).
+   * Opening ← previous close counted qty when present, else current system.
+   * Added ← receipt movements that day; Used ← consumption/POS/production outflows;
+   * Waste ← waste movements; Expected = Opening + Added − Used − Waste.
+   * Closing ← counted qty from closing_stock event that day when present.
+   */
+  async getDailyStockLedger(shopId: string = '1', dateIso?: string) {
+    const day = (dateIso || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const dayStart = new Date(`${day}T00:00:00.000Z`);
+    const dayEnd = new Date(`${day}T23:59:59.999Z`);
+
+    const projections = await this.prisma.inventoryProjection.findMany({
+      where: { shop_id: shopId },
+      include: { item: { select: { name: true, unit: true } } },
+      take: 200,
+      orderBy: { item_id: 'asc' },
+    });
+
+    const movements = await this.prisma.inventoryMovement.findMany({
+      where: {
+        shop_id: shopId,
+        created_at: { gte: dayStart, lte: dayEnd },
+      },
+      select: {
+        item_id: true,
+        movement_type: true,
+        quantity: true,
+        unit_cost: true,
+        reference_type: true,
+      },
+      take: 5000,
+    });
+
+    const prevClose = await this.prisma.event.findFirst({
+      where: {
+        shop_id: shopId,
+        event_type: 'closing_stock_counted',
+        created_at: { lt: dayStart },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+    const prevLines = new Map<string, number>();
+    if (prevClose?.payload && typeof prevClose.payload === 'object') {
+      const p = prevClose.payload as Record<string, unknown>;
+      const lines = Array.isArray(p.lines) ? p.lines : [];
+      for (const raw of lines) {
+        if (!raw || typeof raw !== 'object') continue;
+        const row = raw as Record<string, unknown>;
+        const id = String(row.item_id ?? '');
+        const cq = Number(row.counted_qty ?? row.counted_quantity ?? 0);
+        if (id) prevLines.set(id, cq);
+      }
+    }
+
+    const todayClose = await this.prisma.event.findFirst({
+      where: {
+        shop_id: shopId,
+        event_type: 'closing_stock_counted',
+        created_at: { gte: dayStart, lte: dayEnd },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+    const todayLines = new Map<string, Record<string, unknown>>();
+    let sessionMeta: Record<string, unknown> | null = null;
+    if (todayClose?.payload && typeof todayClose.payload === 'object') {
+      const p = todayClose.payload as Record<string, unknown>;
+      sessionMeta = {
+        batchId: p.batch_id,
+        batchNumber: p.batch_number,
+        status: p.status ?? 'completed',
+        countedAt: todayClose.created_at.toISOString(),
+        totalVarianceValue: p.total_variance_value,
+      };
+      const lines = Array.isArray(p.lines) ? p.lines : [];
+      for (const raw of lines) {
+        if (!raw || typeof raw !== 'object') continue;
+        const row = raw as Record<string, unknown>;
+        const id = String(row.item_id ?? '');
+        if (id) todayLines.set(id, row);
+      }
+    }
+
+    type Agg = { added: number; used: number; waste: number; receipts: number };
+    const byItem = new Map<string, Agg>();
+    for (const m of movements) {
+      const cur = byItem.get(m.item_id) ?? { added: 0, used: 0, waste: 0, receipts: 0 };
+      const q = Number(m.quantity);
+      const type = String(m.movement_type || '').toUpperCase();
+      if (q > 0 && (type.includes('RECEIPT') || type.includes('RECEIVE') || type === 'OPENING_BALANCE')) {
+        cur.added += q;
+        cur.receipts += 1;
+      } else if (type.includes('WASTE') || type.includes('EXPIR')) {
+        cur.waste += Math.abs(q);
+      } else if (q < 0 && type !== 'COUNT_ADJUSTMENT') {
+        cur.used += Math.abs(q);
+      }
+      byItem.set(m.item_id, cur);
+    }
+
+    const rows = projections.map((proj) => {
+      const itemId = proj.item_id;
+      const systemQty = Number(proj.available_stock ?? 0);
+      const opening = prevLines.has(itemId) ? prevLines.get(itemId)! : systemQty;
+      const agg = byItem.get(itemId) ?? { added: 0, used: 0, waste: 0, receipts: 0 };
+      const expected = opening + agg.added - agg.used - agg.waste;
+      const today = todayLines.get(itemId);
+      const counted = today
+        ? Number(today.counted_qty ?? today.counted_quantity ?? 0)
+        : null;
+      const variance = counted != null ? counted - expected : null;
+      const unitCost = Number(proj.avg_unit_cost ?? 0) || (
+        systemQty > 0 ? Number(proj.total_value ?? 0) / systemQty : 0
+      );
+      const value =
+        variance != null ? variance * (Number.isFinite(unitCost) ? unitCost : 0) : null;
+      return {
+        item_id: itemId,
+        item_name: proj.item?.name ?? itemId,
+        unit: proj.item?.unit ?? 'pcs',
+        opening,
+        added: agg.added,
+        receipt_count: agg.receipts,
+        used: agg.used,
+        waste: agg.waste,
+        expected_closing: expected,
+        counted_closing: counted,
+        variance,
+        variance_value: value,
+        reason_code: today ? (today.reason_code ?? null) : null,
+        system_qty: systemQty,
+      };
+    });
+
+    return {
+      success: true,
+      shop_id: shopId,
+      date: day,
+      session: sessionMeta,
+      closed: Boolean(todayClose),
+      rows,
+      totals: {
+        items: rows.length,
+        counted: rows.filter((r) => r.counted_closing != null).length,
+        net_variance_value: rows.reduce(
+          (s, r) => s + Number(r.variance_value ?? 0),
+          0,
+        ),
+      },
+    };
+  }
+
+  /** Posted COUNT_ADJUSTMENT movements for a count session / batch id. */
+  async listCountAdjustments(shopId: string, countRef: string) {
+    const movements = await this.prisma.inventoryMovement.findMany({
+      where: {
+        shop_id: shopId,
+        movement_type: 'COUNT_ADJUSTMENT',
+        OR: [
+          { reference_id: countRef },
+          { idempotency_key: { startsWith: `count-adj:${countRef}` } },
+        ],
+      },
+      orderBy: { created_at: 'asc' },
+      include: { item: { select: { name: true, unit: true } } },
+    });
+    return {
+      success: true,
+      shop_id: shopId,
+      count_ref: countRef,
+      items: movements.map((m) => ({
+        id: m.id,
+        item_id: m.item_id,
+        item_name: m.item?.name ?? m.item_id,
+        unit: m.item?.unit ?? 'pcs',
+        batch_id: m.batch_id,
+        quantity: Number(m.quantity),
+        unit_cost: Number(m.unit_cost),
+        value: Number(m.quantity) * Number(m.unit_cost),
+        created_at: m.created_at.toISOString(),
+      })),
+    };
+  }
 }
+

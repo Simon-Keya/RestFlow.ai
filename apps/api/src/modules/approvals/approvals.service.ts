@@ -269,7 +269,59 @@ export class ApprovalsService {
         },
       });
     } catch {
-      // non-fatal
+      // non-fatal audit
+    }
+
+    // Receiving stock is applied on event_type "received" before approval.
+    // Reject must void that stock or inventory keeps the receipt (buns bug).
+    const stockInTypes = new Set(['received', 'RECEIVING']);
+    if (stockInTypes.has(event.event_type)) {
+      const srcPayload = (event.payload ?? {}) as Record<string, unknown>;
+      const qty = Number(
+        event.quantity ??
+          srcPayload.quantity_approved ??
+          srcPayload.quantity ??
+          0,
+      );
+      const unitCost = Number(
+        srcPayload.unit_cost ?? srcPayload.unitCost ?? 0,
+      );
+      const shopId = String(event.shop_id || srcPayload.shop_id || '1');
+      try {
+        await this.eventStore.appendEvent({
+          event_type: 'receive_voided',
+          actor_user_id: actorUserId,
+          idempotency_key: `receive-void-${approvalId}`,
+          item_id: event.item_id ?? (srcPayload.item_id as string) ?? undefined,
+          quantity: qty,
+          unit_cost: unitCost,
+          total_cost: qty > 0 && unitCost > 0 ? qty * unitCost : Number(event.total_cost ?? 0),
+          batch_number: (event as { batch_number?: string }).batch_number
+            ?? (srcPayload.batch_number as string)
+            ?? undefined,
+          payload: {
+            source_event_id: approvalId,
+            source_event_type: event.event_type,
+            item_id: event.item_id ?? srcPayload.item_id,
+            item_name: srcPayload.item_name,
+            quantity: qty,
+            quantity_approved: srcPayload.quantity_approved ?? qty,
+            void_quantity: qty,
+            unit_cost: unitCost,
+            batch_number: srcPayload.batch_number,
+            reason,
+            shop_id: shopId,
+            approval_status: 'rejected',
+          },
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Idempotent replay is OK; different payload would surface as conflict
+        this.logger.error(
+          `receive_voided failed for approval ${approvalId}: ${message}`,
+        );
+        throw err;
+      }
     }
 
     this.logger.log(`Approval ${approvalId} rejected by ${actorUserId}`);

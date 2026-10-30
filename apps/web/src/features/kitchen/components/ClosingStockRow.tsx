@@ -26,7 +26,17 @@ export function ClosingStockRow({
 
   return (
     <TableRow>
-      <TableCell className="font-medium">{entry.name}</TableCell>
+      <TableCell className="font-medium">
+        {entry.name}
+        {(entry as { daysSinceLastCount?: number | null }).daysSinceLastCount !=
+          null &&
+        (entry as { daysSinceLastCount?: number }).daysSinceLastCount! > 0 ? (
+          <span className="mt-0.5 block text-[11px] font-normal text-ink-muted">
+            Last count{" "}
+            {(entry as { daysSinceLastCount?: number }).daysSinceLastCount}d ago
+          </span>
+        ) : null}
+      </TableCell>
       <TableCell className="text-right tabular-nums text-ink-muted">
         {formatQuantity(expected, entry.unit)}
       </TableCell>

@@ -19,6 +19,17 @@ export class ProjectionRebuildProcessor {
   async handleRebuildAll(job: Job<{ shopId?: string }>) {
     const { shopId = '1' } = job.data || {};
 
+    // SAFETY: updateProjections can consume physical FEFO batches.
+    // Replaying historical events through it is not a read-model-only rebuild.
+    // Fail closed BEFORE deleting projections or processing any events.
+    this.logger.error(
+      `Projection rebuild refused for shop ${shopId}: replay may mutate physical stock. No data was changed by this job.`,
+    );
+    throw new Error(
+      'Full projection rebuild is disabled until stock mutations are separated from projection replay.',
+    );
+
+    // The legacy implementation below is intentionally unreachable.
     this.logger.log(`Full projection rebuild for shop ${shopId}`);
 
     try {
@@ -38,7 +49,7 @@ export class ProjectionRebuildProcessor {
       });
 
       if (events.length === 0) {
-        this.logger.log('No events — nothing to rebuild');
+        this.logger.log('No events â€” nothing to rebuild');
         return;
       }
 

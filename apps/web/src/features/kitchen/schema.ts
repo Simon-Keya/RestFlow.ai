@@ -54,7 +54,7 @@ export const closingStockSubmissionSchema = z.object({
     .array(
       z.object({
         itemId: z.string().min(1),
-        countedQuantity: z.number().finite(),
+        countedQuantity: z.number().finite().min(0),
       }),
     )
     .min(1),

@@ -142,10 +142,10 @@ export class KitchenController {
 
   @Post('closing-stock')
   @HttpCode(HttpStatus.CREATED)
-  @Roles('MANAGER', 'ADMIN')
+  @Roles('KITCHEN', 'MANAGER', 'ADMIN')
   @ApiOperation({
     summary:
-      'Submit closing stock count — ADMIN/MANAGER only; writes reconciliation event for accuracy + variance',
+      'Submit closing stock count — KITCHEN/MANAGER/ADMIN; writes reconciliation event for accuracy + variance',
   })
   @UsePipes(new ZodValidationPipe(SubmitClosingStockSchema))
   async submitClosingStock(
@@ -153,6 +153,40 @@ export class KitchenController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.kitchenService.submitClosingStock(body, user?.id);
+  }
+
+  @Get('closing-stock/ledger')
+  @Roles('MANAGER', 'ADMIN')
+  @ApiOperation({ summary: 'Daily stock ledger (Opening/Added/Used/Waste/Expected/Closing)' })
+  @ApiQuery({ name: 'date', required: false, description: 'YYYY-MM-DD' })
+  async getDailyStockLedger(
+    @CurrentShop() scopedShop: string,
+    @Query('date') date?: string,
+  ) {
+    return this.kitchenService.getDailyStockLedger(scopedShop, date);
+  }
+
+  @Get('closing-stock/history')
+  @Roles('KITCHEN', 'MANAGER', 'ADMIN')
+  @ApiOperation({ summary: 'Past closing stock sessions' })
+  async listClosingStockHistory(
+    @CurrentShop() scopedShop: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.kitchenService.listClosingStockHistory(
+      scopedShop,
+      limit ? parseInt(limit, 10) : 50,
+    );
+  }
+
+  @Get('closing-stock/adjustments')
+  @Roles('MANAGER', 'ADMIN')
+  @ApiOperation({ summary: 'COUNT_ADJUSTMENT movements for a count session' })
+  async listCountAdjustments(
+    @CurrentShop() scopedShop: string,
+    @Query('countRef') countRef: string,
+  ) {
+    return this.kitchenService.listCountAdjustments(scopedShop, countRef || '');
   }
 
   @Post('orders/:orderId/status')

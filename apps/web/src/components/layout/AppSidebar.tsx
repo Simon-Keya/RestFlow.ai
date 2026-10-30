@@ -4,7 +4,8 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import {LayoutDashboard,
+import {
+  LayoutDashboard,
   Boxes,
   Package,
   ChefHat,
@@ -18,7 +19,8 @@ import {LayoutDashboard,
   ShieldCheck,
   UsersRound,
   ChevronsLeft,
-  Sparkles} from "lucide-react";
+  Sparkles,
+} from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useShopId } from "@/hooks/use-shop-id";
 import { useAuthStore } from "@/store/auth";

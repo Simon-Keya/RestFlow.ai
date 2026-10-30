@@ -1,10 +1,12 @@
 // apps/api/src/modules/kitchen/dto/closing-stock.dto.ts
 import { z } from 'zod';
 
+/** counted_qty: 0 is valid (empty shelf). Blank/omitted is not this field — client omits uncounted lines. */
 export const ClosingStockLineSchema = z.object({
   item_id: z.string().min(1),
-  counted_qty: z.number().finite(),
+  counted_qty: z.number().finite().min(0),
   notes: z.string().optional(),
+  reason_code: z.string().optional(),
 });
 
 export const SubmitClosingStockSchema = z.object({

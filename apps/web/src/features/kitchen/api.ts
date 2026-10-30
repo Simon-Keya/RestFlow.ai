@@ -495,6 +495,8 @@ export const kitchenApi = {
           lines: submission.entries.map((e) => ({
             item_id: e.itemId,
             counted_qty: e.countedQuantity,
+            notes: (e as { notes?: string }).notes,
+            reason_code: (e as { reasonCode?: string }).reasonCode,
           })),
         },
         { timeout: 120_000 },
@@ -504,6 +506,28 @@ export const kitchenApi = {
     }
   },
 
+
+  async getDailyStockLedger(shopId: string, date?: string): Promise<Record<string, unknown>> {
+    try {
+      const { data } = await apiClient.get(
+        `${endpoints.kitchen.closingStockLedger}${buildQueryString({ shopId, date })}`,
+      );
+      return (data ?? {}) as Record<string, unknown>;
+    } catch (error) {
+      throw toApiError(error);
+    }
+  },
+
+  async listClosingStockHistory(shopId: string): Promise<Record<string, unknown>> {
+    try {
+      const { data } = await apiClient.get(
+        `${endpoints.kitchen.closingStockHistory}${buildQueryString({ shopId })}`,
+      );
+      return (data ?? {}) as Record<string, unknown>;
+    } catch (error) {
+      throw toApiError(error);
+    }
+  },
   async updateOrderStatus(orderId: string, status: string): Promise<void> {
     try {
       await apiClient.post(endpoints.kitchen.updateOrderStatus(orderId), {

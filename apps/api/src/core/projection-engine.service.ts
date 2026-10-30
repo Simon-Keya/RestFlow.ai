@@ -184,6 +184,11 @@ export class ProjectionEngineService {
           await this.handleStockIncrease(payload, shopId, event);
           break;
 
+        case 'receive_voided':
+        case 'received_approval_rejected':
+          await this.handleReceiveVoided(payload, shopId, event);
+          break;
+
         case 'production_finished':
           await this.handleProductionFinished(payload, shopId, event);
           break;
@@ -445,6 +450,11 @@ export class ProjectionEngineService {
     await this.handleStockIncrease(payload, shopId, event);
   }
 
+  /**
+   * Closing stock count: align batches + projection to counted qty.
+   * Optimized for Render: sequential lines, one batch read per item,
+   * no parallel chunk storms (was causing pool exhaustion / endless loading).
+   */
   private async handleClosingStockCount(
     payload: BasePayload,
     shopId: string,
@@ -453,59 +463,198 @@ export class ProjectionEngineService {
     if (lines.length === 0) return;
 
     const resolvedShop = asString(payload.shop_id) || shopId;
+    const countRef =
+      asString(payload.batch_id) ||
+      asString(payload.batch_number) ||
+      asString(payload.display_batch_code) ||
+      `count-${Date.now()}`;
+    const dayKey = new Date().toISOString().slice(0, 10);
 
-    const applyLine = async (raw: unknown): Promise<void> => {
+    for (const raw of lines) {
       const line = asLine(raw);
       const itemId = asString(line['item_id'] ?? line['itemId']);
-      if (!itemId) return;
+      if (!itemId) continue;
 
-      const countedQty = asNumber(
-        line['counted_qty'] ??
-          line['counted_quantity'] ??
-          line['countedQuantity'],
+      const countedQty = Math.max(
+        0,
+        asNumber(
+          line['counted_qty'] ??
+            line['counted_quantity'] ??
+            line['countedQuantity'],
+        ),
       );
-      const unitCost = asNumber(line['unit_cost'] ?? line['unitCost']);
-      const newValue = Math.max(0, countedQty) * (unitCost > 0 ? unitCost : 0);
+      let unitCost = asNumber(line['unit_cost'] ?? line['unitCost']);
 
-      await this.ensureItemExists(itemId, {
-        item_id: itemId,
-        item_name: asString(line['item_name'] ?? line['itemName']),
-        unit: asString(line['unit']),
-        category: normalizeInventoryCategory(asString(line['category'])),
-      });
-
-      const row = await this.activeDb.inventoryProjection.upsert({
-        where: {
-          shop_id_item_id: { shop_id: resolvedShop, item_id: itemId },
-        },
-        update: {
-          available_stock: Math.max(0, countedQty),
-          ...(unitCost > 0 ? { total_value: newValue } : {}),
-        },
-        create: {
-          shop_id: resolvedShop,
+      try {
+        await this.ensureItemExists(itemId, {
           item_id: itemId,
-          available_stock: Math.max(0, countedQty),
-          total_value: newValue,
-          expired_stock: 0,
-          damaged_stock: 0,
-        },
-      });
+          item_name: asString(line['item_name'] ?? line['itemName']),
+          unit: asString(line['unit']),
+          category: normalizeInventoryCategory(asString(line['category'])),
+        });
 
-      // Fire-and-forget WS notify — do not block closing stock response
-      void this.emitStock(
-        itemId,
-        resolvedShop,
-        row,
-        asString(line['item_name'] ?? line['itemName']),
-      );
-    };
+        const existing = await this.activeDb.inventoryProjection.findUnique({
+          where: {
+            shop_id_item_id: { shop_id: resolvedShop, item_id: itemId },
+          },
+        });
 
-    // Bounded concurrency (avoid sequential 100+ upserts timing out on free tier)
-    const chunkSize = 12;
-    for (let i = 0; i < lines.length; i += chunkSize) {
-      const chunk = lines.slice(i, i + chunkSize);
-      await Promise.all(chunk.map((raw) => applyLine(raw)));
+        // Authoritative system qty = batch remainders (Inventory UI uses this).
+        // Using projection alone skipped FEFO when an earlier broken close had
+        // already written counted qty onto the projection.
+        const todayStart = this.projectionShopLocalDayStart(new Date());
+        const openBatches = await this.activeDb.inventoryBatch.findMany({
+          where: {
+            shop_id: resolvedShop,
+            item_id: itemId,
+            qty_remaining: { gt: 0 },
+            OR: [{ expiry_date: null }, { expiry_date: { gte: todayStart } }],
+          },
+          select: { qty_remaining: true, unit_cost: true },
+        });
+        let systemQty = 0;
+        let batchValue = 0;
+        for (const b of openBatches) {
+          const q = Math.max(0, Number(b.qty_remaining));
+          systemQty += q;
+          batchValue += q * Number(b.unit_cost ?? 0);
+        }
+        if (systemQty <= 0) {
+          systemQty = Number(existing?.available_stock ?? 0);
+        }
+        if (!(unitCost > 0) && systemQty > 0) {
+          if (batchValue > 0) unitCost = batchValue / systemQty;
+          else if (existing) {
+            const tv = Number(existing.total_value ?? 0);
+            if (tv > 0) unitCost = tv / systemQty;
+          }
+        }
+
+        const delta = countedQty - systemQty;
+
+        if (Math.abs(delta) > 1e-9) {
+          if (delta < 0) {
+            const need = Math.abs(delta);
+            const batches = await this.activeDb.inventoryBatch.findMany({
+              where: {
+                shop_id: resolvedShop,
+                item_id: itemId,
+                qty_remaining: { gt: 0 },
+              },
+              orderBy: [
+                { expiry_date: 'asc' },
+                { received_at: 'asc' },
+                { id: 'asc' },
+              ],
+            });
+            let remaining = need;
+            for (const batch of batches) {
+              if (remaining <= 1e-9) break;
+              const have = Math.max(0, Number(batch.qty_remaining));
+              if (have <= 0) continue;
+              const take = Math.min(have, remaining);
+              await this.activeDb.inventoryBatch.update({
+                where: { id: batch.id },
+                data: { qty_remaining: Math.max(0, have - take) },
+              });
+              try {
+                await this.activeDb.inventoryMovement.create({
+                  data: {
+                    shop_id: resolvedShop,
+                    batch_id: batch.id,
+                    item_id: itemId,
+                    movement_type: 'COUNT_ADJUSTMENT',
+                    quantity: -take,
+                    unit_cost: batch.unit_cost,
+                    reference_type: 'stock_count',
+                    reference_id: countRef,
+                    idempotency_key: `count-adj:${countRef}:${itemId}:${batch.id}`,
+                  },
+                });
+              } catch {
+                /* duplicate movement on retry */
+              }
+              remaining -= take;
+            }
+          } else {
+            const cost =
+              unitCost > 0 ? unitCost : Number(existing?.avg_unit_cost ?? 0);
+            try {
+              await this.fefoStock.recordReceiveBatch({
+                shopId: resolvedShop,
+                itemId,
+                batchNumber: `COUNT-ADJ-${dayKey}-${itemId.slice(0, 8)}`,
+                quantity: delta,
+                unitCost: Math.max(0, cost),
+                expiryDate: existing?.next_expiry_date ?? null,
+                eventId: `${countRef}:${itemId}`,
+                qtyOnHandBefore: systemQty,
+                oldWac: Number(existing?.avg_unit_cost ?? cost),
+                movementType: 'COUNT_ADJUSTMENT',
+              });
+            } catch (err: unknown) {
+              const message =
+                err instanceof Error ? err.message : String(err);
+              this.logger.error(
+                `Count surplus batch failed for ${itemId}: ${message}`,
+              );
+            }
+          }
+        }
+
+        // Single read of remainders → projection (skip extra sumUsableBatches)
+        const remainders = await this.activeDb.inventoryBatch.findMany({
+          where: {
+            shop_id: resolvedShop,
+            item_id: itemId,
+            qty_remaining: { gt: 0 },
+            OR: [{ expiry_date: null }, { expiry_date: { gte: todayStart } }],
+          },
+          select: { qty_remaining: true, unit_cost: true },
+        });
+        let batchQty = 0;
+        let remainderValue = 0;
+        for (const b of remainders) {
+          const q = Math.max(0, Number(b.qty_remaining));
+          batchQty += q;
+          remainderValue += q * Number(b.unit_cost ?? 0);
+        }
+        // Prefer counted when batches reconciled within tolerance
+        const nextStock =
+          Math.abs(batchQty - countedQty) < 0.05 ? countedQty : batchQty;
+        const nextValue = Math.max(0, remainderValue);
+
+        const row = await this.activeDb.inventoryProjection.upsert({
+          where: {
+            shop_id_item_id: { shop_id: resolvedShop, item_id: itemId },
+          },
+          update: {
+            available_stock: nextStock,
+            total_value: nextValue,
+          },
+          create: {
+            shop_id: resolvedShop,
+            item_id: itemId,
+            available_stock: nextStock,
+            total_value: nextValue,
+            expired_stock: 0,
+            damaged_stock: 0,
+          },
+        });
+
+        void this.emitStock(
+          itemId,
+          resolvedShop,
+          row,
+          asString(line['item_name'] ?? line['itemName']),
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(
+          `Closing stock align failed for ${itemId}: ${message}`,
+        );
+        // Continue other lines — do not hang entire close on one SKU
+      }
     }
   }
 
@@ -651,6 +800,160 @@ export class ProjectionEngineService {
     }
 
     await this.emitStock(itemId, shopId, row, asString(payload.item_name));
+  }
+
+  /**
+   * Reverse stock from a rejected receiving approval.
+   * Rule: void min(batch.qty_remaining, original receive qty) on the batch tied to
+   * source_event_id (event_id on InventoryBatch). Recompute projection from usable batches.
+   * Partial consumption after receive → only remaining qty is removed; shortfall is logged.
+   */
+  private async handleReceiveVoided(
+    payload: BasePayload,
+    shopId: string,
+    event: Partial<
+      Pick<ProjectionEvent, 'id' | 'item_id' | 'quantity' | 'total_cost' | 'unit_cost' | 'batch_number'>
+    >,
+  ): Promise<void> {
+    const itemId =
+      asString(event.item_id) ||
+      asString(payload.item_id) ||
+      asString(payload.itemId);
+    const sourceEventId =
+      asString(payload.source_event_id) ||
+      asString(payload.sourceEventId) ||
+      asString(payload.receive_event_id);
+    const batchNumber =
+      asString(payload.batch_number) ||
+      asString(event.batch_number) ||
+      asString(payload.batchNumber);
+    const requestedQty = Math.abs(
+      asNumber(
+        event.quantity ??
+          payload.quantity_approved ??
+          payload.quantity ??
+          payload.void_quantity,
+      ),
+    );
+
+    if (!itemId || requestedQty <= 0) {
+      this.logger.warn(
+        `receive_voided skipped: missing itemId or qty (item=${itemId}, qty=${requestedQty})`,
+      );
+      return;
+    }
+
+    await this.ensureItemExists(itemId, payload);
+
+    let batch =
+      sourceEventId
+        ? await this.activeDb.inventoryBatch.findFirst({
+            where: {
+              shop_id: shopId,
+              item_id: itemId,
+              event_id: sourceEventId,
+            },
+            orderBy: { received_at: 'desc' },
+          })
+        : null;
+
+    if (!batch && batchNumber) {
+      batch = await this.activeDb.inventoryBatch.findFirst({
+        where: {
+          shop_id: shopId,
+          item_id: itemId,
+          batch_number: batchNumber,
+          qty_remaining: { gt: 0 },
+        },
+        orderBy: { received_at: 'desc' },
+      });
+    }
+
+    let take = 0;
+    if (batch) {
+      const have = Math.max(0, Number(batch.qty_remaining));
+      take = Math.min(have, requestedQty);
+      if (take < requestedQty - 1e-9) {
+        this.logger.warn(
+          `receive_voided partial: requested=${requestedQty} remaining_on_batch=${have} ` +
+            `batch=${batch.id} source=${sourceEventId} (stock already consumed after receive)`,
+        );
+      }
+      if (take > 0) {
+        await this.activeDb.inventoryBatch.update({
+          where: { id: batch.id },
+          data: { qty_remaining: Math.max(0, have - take) },
+        });
+        const voidEventId =
+          asString(event.id) || sourceEventId || `void-${Date.now()}`;
+        try {
+          await this.activeDb.inventoryMovement.create({
+            data: {
+              shop_id: shopId,
+              batch_id: batch.id,
+              item_id: itemId,
+              movement_type: 'RECEIVE_VOID',
+              quantity: -take,
+              unit_cost: batch.unit_cost,
+              reference_type: 'approval_reject',
+              reference_id: sourceEventId || voidEventId,
+              idempotency_key: `receive-void:${sourceEventId || voidEventId}:${batch.id}`,
+            },
+          });
+        } catch {
+          /* unique idempotency on replay */
+        }
+      }
+    } else {
+      // No batch row found — FEFO drain as last resort so projection does not keep ghost stock
+      this.logger.warn(
+        `receive_voided: no batch for source=${sourceEventId} batch_number=${batchNumber}; FEFO partial drain`,
+      );
+      try {
+        const consumed = await this.fefoStock.consumeStock(
+          shopId,
+          itemId,
+          requestedQty,
+          {
+            allowPartial: true,
+            referenceType: 'approval_reject',
+            referenceId: sourceEventId || asString(event.id) || `void-${itemId}`,
+            movementType: 'RECEIVE_VOID',
+          },
+        );
+        take = consumed.quantity;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(`receive_voided FEFO drain failed for ${itemId}: ${message}`);
+      }
+    }
+
+    const totals = await this.sumUsableBatches(shopId, itemId);
+    await this.activeDb.inventoryProjection.upsert({
+      where: {
+        shop_id_item_id: { shop_id: shopId, item_id: itemId },
+      },
+      update: {
+        available_stock: totals.qty,
+        total_value: totals.value,
+        avg_unit_cost:
+          totals.qty > 0 ? totals.value / totals.qty : 0,
+      },
+      create: {
+        shop_id: shopId,
+        item_id: itemId,
+        available_stock: totals.qty,
+        total_value: totals.value,
+        avg_unit_cost: totals.qty > 0 ? totals.value / totals.qty : 0,
+        expired_stock: 0,
+        damaged_stock: 0,
+      },
+    });
+
+    this.logger.log(
+      `receive_voided item=${itemId} voided_qty=${take} requested=${requestedQty} ` +
+        `source=${sourceEventId} projection_qty=${totals.qty}`,
+    );
   }
 
   /**

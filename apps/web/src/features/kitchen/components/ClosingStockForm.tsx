@@ -42,18 +42,27 @@ export function ClosingStockForm({
     );
   }
 
-  const completedCount = entries.filter((e) => counts[e.itemId]?.trim()).length;
+  /** Blank = not counted; "0" = counted zero (valid). */
+  const completedCount = entries.filter((e) => {
+    const v = counts[e.itemId];
+    return v !== undefined && v !== null && String(v).trim() !== "";
+  }).length;
 
   function handleSubmit() {
     if (!canSubmit) return;
-    onSubmit({
-      entries: entries
-        .filter((e) => counts[e.itemId]?.trim())
-        .map((e) => ({
+    const entriesToSend = entries
+      .filter((e) => {
+        const v = counts[e.itemId];
+        return v !== undefined && v !== null && String(v).trim() !== "";
+      })
+      .map((e) => {
+        const n = Number(counts[e.itemId]);
+        return {
           itemId: e.itemId,
-          countedQuantity: Number(counts[e.itemId]),
-        })),
-    });
+          countedQuantity: Number.isFinite(n) && n >= 0 ? n : 0,
+        };
+      });
+    onSubmit({ entries: entriesToSend });
   }
 
   return (
@@ -94,7 +103,7 @@ export function ClosingStockForm({
         <p className="text-xs text-ink-muted">
           {canSubmit
             ? `${completedCount} of ${entries.length} counted`
-            : `${entries.length} items · submission restricted to admin/manager`}
+            : `${entries.length} items · 0 is a valid count (empty stock)`}
         </p>
         {canSubmit ? (
           <Button

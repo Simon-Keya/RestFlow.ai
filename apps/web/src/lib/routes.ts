@@ -48,6 +48,10 @@ export const routes = {
   variance: (shopId: string) => `/shop/${shopId}/dashboard/variance`,
   varianceBatch: (shopId: string, batchId: string) =>
     `/shop/${shopId}/dashboard/variance/batch/${batchId}`,
+  stockLedger: (shopId: string, date?: string) =>
+    date
+      ? `/shop/${shopId}/dashboard/variance/stock-ledger?date=${date}`
+      : `/shop/${shopId}/dashboard/variance/stock-ledger`,
 
   approvals: (shopId: string) => `/shop/${shopId}/dashboard/approvals`,
   team: (shopId: string) => `/shop/${shopId}/dashboard/team`,
