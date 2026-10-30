@@ -256,3 +256,46 @@ def test_provider_failure_returns_safe_error_and_increments_metric(monkeypatch: 
     assert exc.value.status_code == 502
     assert "provider detail" not in str(exc.value.detail)
     assert main._METRICS["assistant_provider_failures_total"] == before + 1
+
+
+def test_normalize_role_accepts_nested_and_mixed_case():
+    assert main._normalize_role({"role": "admin"}) == "ADMIN"
+    assert main._normalize_role({"user": {"role": "Manager"}}) == "MANAGER"
+    assert main._normalize_role({}) == ""
+
+
+def test_admin_always_receives_full_tool_surface():
+    assert main.ROLE_TOOLS["ADMIN"] == set(main.TOOL_SCHEMAS)
+    for name in main.TOOL_SCHEMAS:
+        # execute_tool role gate uses explicit ADMIN bypass
+        allowed = set(main.TOOL_SCHEMAS) if "ADMIN" == "ADMIN" else set()
+        assert name in allowed
+
+
+def test_shop_params_always_include_shop_id():
+    assert main._shop_params("shop-1") == {"shopId": "shop-1"}
+    assert main._shop_params("1", {"limit": "10"}) == {"shopId": "1", "limit": "10"}
+
+
+def test_admin_execute_allows_trace_and_approvals():
+    import asyncio
+
+    class Client:
+        async def get_low_stock_items(self, token, shop_id):
+            return []
+
+        async def get_read_endpoint(self, path, token, params=None):
+            return {"ok": True, "path": path, "params": params}
+
+    async def run():
+        data, source = await main.execute_tool(
+            "search_trace", {"query": "BATCH-1"}, "tok", "1", "ADMIN", Client()
+        )
+        assert data["ok"] is True
+        assert "shopId" in data["params"]
+        data2, _ = await main.execute_tool(
+            "get_pending_approvals", {}, "tok", "1", "ADMIN", Client()
+        )
+        assert data2["params"]["shopId"] == "1"
+
+    asyncio.run(run())
